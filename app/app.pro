@@ -28,15 +28,20 @@ CONFIG += c++20
 #DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
 SOURCES += \
+    autostart.cpp \
     devicelist.cpp \
     main.cpp \
     mainwindow.cpp \
+    settingspage.cpp \
     singleinstance.cpp \
     titlebar.cpp \
 
 HEADERS += \
+    autostart.h \
     devicelist.h \
+    elidedlabel.h \
     mainwindow.h \
+    settingspage.h \
     singleinstance.h \
     titlebar.h \
 

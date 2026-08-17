@@ -9,6 +9,7 @@
  *   #2A2C31  hover                   #7E838B  text, micro-labels
  *   #2F3238  controls                #5F646C  text, disabled
  *   #34363B  borders, raised
+ *   #3D4046  borders, fields
  *   #2B2D31  borders, hairline       #4EC97A  mounted
  *                                    #E0A33C  busy
  *                                    #E0564C  error     (unused so far)
@@ -274,14 +275,148 @@ QLabel#deviceCountLbl {
  * and each border would have to be subtracted from the number by hand. What is
  * left here is colour, type and roundness. */
 
-/* The stack the title bar's tabs switch, and the second of its two pages, which
- * is empty until there are settings to put in it. Both transparent so that what
- * shows behind them is #centralwidget's own fill and not a second one. */
+/* The stack the title bar's tabs switch, and the second of its two pages. Both
+ * transparent so that what shows behind them is #centralwidget's own fill and
+ * not a second one. */
 
 QStackedWidget#contentStack,
-QWidget#settingsPage {
+QWidget#settingsPage,
+QWidget#settingsContent,
+QScrollArea#settingsScroll {
     background: transparent;
     border: none;
+}
+
+/* ------------------------------------------------------------- the settings
+ * A column of rows, each a label and the field it names - laid out by a form
+ * layout in settingspage.cpp, which is what keeps the labels in a column of
+ * their own as more rows arrive.
+ *
+ * The label is the secondary grey and the field the primary near-white: the
+ * value is what is being read, and the label only says which value it is. Both
+ * at 12px, the size the second line of a device row is set in - a form of rows
+ * at the window's own 15px would fill the page with two of them. */
+
+QLabel#settingsLabel { 
+    color: #A9AEB6;
+    font-size: 12px;
+}
+
+/* The one text field in the window. Sunk into the page rather than raised off
+ * it - the deeper #191A1D the title bar and status bar are painted in, so it
+ * reads as somewhere to type instead of as another button.
+ *
+ * The placeholder needs no rule: Qt derives its colour from the text colour
+ * above, at half alpha, which is the muted grey it would otherwise be given
+ * here. */
+
+QLineEdit#settingsInput {
+    background: #191A1D;
+    border: 1px solid #3D4046;
+    border-radius: 6px;
+    color: #E8E9EC;
+    font-size: 12px;
+    padding: 4px 8px;
+    selection-background-color: #2F3238;
+    selection-color: #E8E9EC;
+}
+
+/* The only state it has. Lifted to the grey the disabled text is in, which is
+ * as far as a border can be brought up without becoming a second thing to
+ * read. */
+QLineEdit#settingsInput:focus { border-color: #5F646C; }
+
+/* A value that is shown rather than typed - the shared root, so far. The same
+ * near-white the fields are set in, because it is the same kind of thing: what
+ * this setting holds. No border and no fill, because there is nothing to type
+ * into - the button beside it is what changes it. */
+
+QLabel#settingsPath {
+    background: transparent;
+    color: #E8E9EC;
+    font-size: 12px;
+}
+
+/* The button that opens the folder dialog. The design's secondary button: a
+ * raised fill inside a border a shade lighter than the fields', which is what
+ * separates a thing to press from a thing to read.
+ *
+ * It has to name itself past the plain QPushButton rule further down, which
+ * dresses the dialog buttons and gives them a min-width no row here has room
+ * for. */
+
+QPushButton#settingsChooseBtn {
+    background: #26282C;
+    border: 1px solid #3D4046;
+    border-radius: 6px;
+    color: #C7CBD1;
+    font-size: 12px;
+    padding: 4px 12px;
+    min-width: 0px;
+}
+
+QPushButton#settingsChooseBtn:hover   { background: #2F3238; }
+QPushButton#settingsChooseBtn:pressed { background: #212226; }
+
+/* The third column: the button that puts a field back to the value this app
+ * ships with, shown only while a field holds something else. Nothing but the
+ * glyph until the pointer is on it - the row belongs to the field, and a button
+ * with a frame of its own beside every one of them would read as the busier
+ * half of the page.
+ *
+ * The arrow is artwork and takes no colour from `color:`, the way the badges
+ * and the caption glyphs do not. Its #A9AEB6 is in reverse.svg, the same grey
+ * the labels on the left are set in - so a change here has to be made there. */
+
+QToolButton#settingsRevert {
+    background: transparent;
+    border: none;
+    border-radius: 5px;
+    padding: 0px;
+}
+
+QToolButton#settingsRevert:hover   { background: #2A2C31; }
+QToolButton#settingsRevert:pressed { background: #26282C; }
+
+/* The rule between the fields and the switches. The hairline grey, not the
+ * raised one: it divides two halves of one page rather than standing where a
+ * window border would. Its height is set in settingspage.cpp, like the dots. */
+
+QWidget#settingsSeparator { background: #2B2D31; }
+
+/* A switch. It is a QCheckBox - the thing it does is the thing a check box
+ * does - wearing the pill the design draws, which arrives as artwork because
+ * neither the track nor the knob on it can be drawn by a stylesheet. Two files,
+ * one per state, the way the tabs in the title bar carry one per state: the
+ * colours are in switch_on.svg and switch_off.svg, and this rule only says
+ * which is which and how big it is.
+ *
+ * `spacing` is the gap between the pill and the label after it. The note under
+ * that label is indented by the sum of the two - see SWITCH_TEXT_INDENT in
+ * settingspage.cpp, which has to be answered if either number changes here. */
+
+QCheckBox#settingsSwitch {
+    background: transparent;
+    color: #E8E9EC;
+    font-size: 12px;
+    spacing: 12px;
+}
+
+QCheckBox#settingsSwitch::indicator {
+    width: 34px;
+    height: 19px;
+    image: url(:/assets/switch_off.svg);
+}
+
+QCheckBox#settingsSwitch::indicator:checked { image: url(:/assets/switch_on.svg); }
+
+/* The note under a field. Muted, and a step down in size from the field it
+ * belongs to, so it reads as a remark on that value rather than as another
+ * thing to fill in. */
+
+QLabel#settingsHint {
+    color: #8D929A;
+    font-size: 11px;
 }
 
 QWidget#deviceList,
@@ -300,6 +435,16 @@ QWidget#deviceRow {
 }
 
 QWidget#deviceRow:hover { background: #26282C; }
+
+/* A held click, in the title bar and status bar's own #191A1D - darker than
+ * the hover it is drawn over, and darker than the content behind that, so the
+ * row reads as pressed into the window rather than merely dimmed. On a
+ * property rather than :pressed, which Qt sets for the button classes and
+ * never for a plain QWidget: see DeviceRow::mousePressEvent. It follows the
+ * hover rule because the two are equally specific and a row is always hovered
+ * while it is held, so the later of them is what shows. */
+
+QWidget#deviceRow[pressed="true"] { background: #191A1D; }
 
 /* The rules from here down used to be the mono half of the window and each
  * named the family itself. They name none now - the QWidget rule at the top

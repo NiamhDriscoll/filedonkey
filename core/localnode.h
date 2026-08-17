@@ -36,6 +36,63 @@ public:
     // asks us, every peer learns it from the datagrams we send.
     QString localEndpoint() const;
 
+    // What this machine calls itself in every announcement it sends, and the settings page's way of
+    // changing it. Stored in QSettings, with the machine's own host name as the answer while the
+    // user has set nothing - which is what every announcement carried before there was a field to
+    // set it in.
+    //
+    // Static and read from the settings on each call rather than kept in a member: the page that
+    // writes it is built before the node exists, and re-reading is what lets the next broadcast
+    // carry a name the user has just typed with no signal wired between the two. A peer that has
+    // already found us keeps the name it was given, though - it writes a machine down once, when it
+    // first hears from it, so a rename only reaches it when the connection is made again.
+    static QString machineName();
+
+    // Empty puts it back to following the host name. Whitespace at either end is dropped: it cannot
+    // be seen in the field it was typed in and would be a second name in every peer's list.
+    static void setMachineName(const QString &name);
+
+    // The directory this machine serves to its peers, and all that any of them can reach: a request
+    // naming a path is answered under this one - see normalizePath() in fusebackend.h - so what is
+    // outside it does not exist as far as the protocol is concerned.
+    //
+    // Read once, when the node builds its backend, and handed to it there. A folder chosen while the
+    // application runs is served from the next start: the backend answers requests on several
+    // threads at once, and the peers already mounted are reading a tree that would move under them.
+    //
+    // Stored exactly as it was chosen, and not checked against the disk. A drive that is not there
+    // this morning makes every request under it fail, which is the right way round - falling back to
+    // the default would quietly serve the home directory in place of the folder that went away.
+    static QString sharedRoot();
+    static void setSharedRoot(const QString &path);
+
+    // What each of these answers while the user has chosen nothing. Asked by the settings page,
+    // which offers to put a field back to its default and has to know when it is already there -
+    // and which should not be the second place in this project that writes 5454 down.
+    static QString defaultMachineName();
+    static int defaultTransferPort();
+    static QString defaultSharedRoot();
+
+    // The two ports this machine uses: the UDP port announcements are broadcast to and answered on,
+    // and the TCP port the server serving our exported directory listens on. Both stored the same
+    // way the name is, with the numbers this app has always used as the answer while nothing is
+    // stored, and both read once in the constructor - a port changed while the application runs
+    // reaches nothing until it is started again, because the sockets are bound by then.
+    static int discoveryPort();
+    static int transferPort();
+
+    // Only the transfer port can be set, and only it has a field on the settings page. A peer is
+    // told which port to dial - every announcement carries it - so one machine can move it and the
+    // rest follow. The discovery port is the opposite: it is the port a broadcast is sent to as
+    // well as the one it is heard on, so a machine that moves it alone is announcing itself into a
+    // port no one is listening on and hearing nothing back, with no sign of it beyond an empty
+    // device list. It stays readable from the settings for the rare network that has to move it on
+    // every machine at once, and is offered nowhere.
+    //
+    // Out of range, or the number this app defaults to, and nothing is kept - the same as never
+    // having set one.
+    static void setTransferPort(int port);
+
 signals:
     // Forwarded from the FUSEClient of whichever VirtDisk moved the bytes, named so the device list
     // can put them on the right row - the counters have always been per-peer, and until there was a
@@ -92,6 +149,14 @@ private:
     QTimer     *discoveryTimer = nullptr;
 
     QString machineId;      // our own, so we can tell our announcements from a peer's
+
+    // The discovery port this session bound, kept because it is also the port every announcement is
+    // sent to and the two must be the same one. Read from the settings once, in the constructor:
+    // reading it again at each broadcast would have a change made mid-session announcing us on a
+    // port nothing is listening on, ours included. The transfer port needs no twin - the server
+    // knows what it bound, and serverPort() is what the announcements carry.
+    quint16 udpPort = 0;
+
     QMap<QString, Connection> connections;
     QMap<OperationType, RequestHandler> fuseHandlers;
 
