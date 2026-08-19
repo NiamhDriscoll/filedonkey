@@ -36,6 +36,14 @@ public:
     // asks us, every peer learns it from the datagrams we send.
     QString localEndpoint() const;
 
+    // The address half of it on its own, and empty on the same terms. Asked for by the manual
+    // connect dialog, which fills its first three octets with ours: the machine being reached by
+    // hand is almost always on this network, and three of the four numbers are then already right.
+    //
+    // Static because that dialog is built from the device list, which has no node to ask - and it
+    // needs nothing of ours to answer, unlike localEndpoint() which also reports the bound port.
+    static QString localAddress();
+
     // What this machine calls itself in every announcement it sends, and the settings page's way of
     // changing it. Stored in QSettings, with the machine's own host name as the answer while the
     // user has set nothing - which is what every announcement carried before there was a field to
@@ -93,7 +101,31 @@ public:
     // having set one.
     static void setTransferPort(int port);
 
+    // Takes on a peer that no broadcast found, by dialling the address the user typed and trading
+    // announcements over TCP - see OperationType::hello. This is the whole point of the manual
+    // route: a network that drops UDP leaves discovery with nothing to work with, while the TCP
+    // port every transfer already runs over is by definition open, or the app would be useless on
+    // that network anyway.
+    //
+    // Returns at once. The attempt runs on this thread's event loop and ends in one of three
+    // places: peerAdded, manualConnectFailed, or - when that address is already in the list -
+    // nothing at all, the device being on screen already.
+    void connectManually(const QString &address, int port);
+
+    // Another go at a peer whose mount failed. Nothing tries again on its own - see the note on
+    // peerMountFailed - so this is the only way back for such a peer short of restarting the
+    // application, and it is what the Retry button on its row is wired to.
+    //
+    // Does nothing for a machine that is not in that state: one that is mounted or still mounting
+    // has a VirtDisk already, and one that has gone away is out of the list altogether.
+    void retryMount(const QString &machineId);
+
 signals:
+    // Why an address typed into the manual connect dialog came to nothing, in a sentence fit to
+    // show - see connectManually(). Only the failures: a peer that answers arrives through
+    // peerAdded like any other, and the row appearing is what says it worked.
+    void manualConnectFailed(const QString &address, const QString &reason);
+
     // Forwarded from the FUSEClient of whichever VirtDisk moved the bytes, named so the device list
     // can put them on the right row - the counters have always been per-peer, and until there was a
     // list to show them in there was nowhere for the name to go.
@@ -101,22 +133,71 @@ signals:
     void peerDownloaded(const QString &machineId, u64 downloaded);
 
     // Emitted as peers come and go, and as their mounts come up, for the window's device list to
-    // build on. A peer arrives as peerAdded with its mount already started, then either reaches
-    // peerMounted or goes straight to peerRemoved if the mount never came up.
+    // build on. A peer arrives as peerAdded with its mount already started, and then reaches one
+    // of three places: peerMounted, peerMountFailed if the mount could not be brought up, or
+    // peerRemoved if it went away before either.
     void peerAdded(const Connection &conn);
     void peerMounted(const QString &machineId, const QString &mountPoint);
     void peerRemoved(const QString &machineId);
+
+    // The mount could not be brought up, with the reason in a sentence fit to show. Unlike
+    // peerRemoved this is not the end of the peer: it stays in the list, and stays in connections
+    // here, and nothing tries to mount it again until retryMount() is called.
+    //
+    // That refusal to retry is the point of the signal. Both machines mount each other, and a
+    // mount that fails drops the socket the other side reads as us leaving, so it unmounts too;
+    // forgetting the peer here - which is what an ordinary teardown does, so it can be found
+    // again - had the next broadcast start the whole thing over five seconds later, and every five
+    // seconds after that, for as long as the cause of the failure lasted. The peer that could
+    // mount now keeps its mount, and this side says why it has none instead of trying forever.
+    void peerMountFailed(const QString &machineId, const QString &reason);
 
 public slots:
     void onBroadcasting();
     void onConnection();
     void onSocketReadyRead();
     void onSocketDisconnected();
-    void onVirtDiskStopped();
+    void onVirtDiskStopped(const QString &reason);
 
 private:
     void broadcast();
+
+    // Takes down the rows of peers whose mounts failed and which are no longer there to retry
+    // against. Run off the broadcast timer, which is the clock it measures against - see
+    // FAILED_PEER_TIMEOUT_MS - and needs no timer of its own.
+    void sweepFailedPeers();
+
+    // Whether the socket this peer dialled our server on is still up, which is the other way a
+    // failed peer can show it is still running when no broadcast reaches us.
+    bool isPeerServed(const QString &machineId) const;
+
     void invite(const QHostAddress &address);
+
+    // What this machine says about itself, as the JSON both routes carry: the two UDP paths above
+    // and the TCP handshake below all send this same object, so a field added for one of them
+    // cannot go missing on the others.
+    QByteArray machineDatagram() const;
+
+    // Everything that follows from learning about a peer, whichever way we learned: write it down,
+    // mount it, and say so. False when there was nothing to do - our own announcement come back to
+    // us, a machine already in the list, or a reply with no id in it - so a caller can tell a peer
+    // it has just taken on from one it already had.
+    bool addPeer(const Connection &conn);
+
+    // Builds this peer's VirtDisk, wires what it reports to the signals above, and starts the
+    // mount. Split out of addPeer() for retryMount(), which does this and nothing else - the peer
+    // is written down already, and the row for it is on screen.
+    void startMount(const Connection &conn);
+
+    // A peer has dialled in and introduced itself. Answers with our own announcement and then takes
+    // it on, which is what makes the handshake mutual: neither side has to be the one that started
+    // it for both to end up mounted.
+    void handleHello(QTcpSocket *socket, const DatagramHeader &header, const QByteArray &payload);
+
+    // The opposite, and much less: a peer saying it is closing this socket without going anywhere.
+    // Takes no header and no payload because the operation carries neither - the fact of it is the
+    // whole message.
+    void handleBye(QTcpSocket *socket);
 
     void dispatchRequest(QTcpSocket *socket, const DatagramHeader &header, const QByteArray &payload);
 
@@ -168,6 +249,17 @@ private:
         QString    machineId;
         u64        uploaded   = 0;
         u64        downloaded = 0;
+
+        // Set when the only thing this socket ever carried was a hello. The machine that dialled in
+        // with one drops it as soon as it has our answer and comes back on a socket of its own, so
+        // its going away says nothing about the peer - see onSocketDisconnected(), which would
+        // otherwise read that FIN as the peer leaving and stop the mount we had just started.
+        bool       handshake  = false;
+
+        // Set when the peer said it was closing this socket and staying - see OperationType::bye.
+        // Read by onSocketDisconnected(), which would otherwise take the drop for the peer leaving
+        // and stop a mount that is working.
+        bool       graceful   = false;
     };
 
     // Everything this machine has moved for one peer, over both of the sockets it involves: the one
@@ -186,6 +278,14 @@ private:
     QMap<QTcpSocket*, ServedPeer> served;
     QMap<QString, Transfer> transfers;
     QMap<QString, VirtDisk*> virtDisks;
+
+    // The peers whose mounts failed, against the last moment each was heard from. A machine is in
+    // here exactly while it is in connections with no VirtDisk of its own: kept so its row can say
+    // why and offer another go, and not mounted again until the user asks - see peerMountFailed.
+    //
+    // The time is what lets such a peer be let go of when it stops answering, since nothing else
+    // about it will ever change again on its own. See sweepFailedPeers().
+    QMap<QString, qint64> failedPeers;
     FUSEBackend *fuseBackend = nullptr;
 
     QThreadPool handlerPool;

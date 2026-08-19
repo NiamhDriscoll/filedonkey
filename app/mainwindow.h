@@ -1,6 +1,7 @@
 #ifndef MAINWINDOW_H
 #define MAINWINDOW_H
 
+#include "closechoicedialog.h"
 #include "core.h"
 #include "devicelist.h"
 #include "localnode.h"
@@ -59,12 +60,26 @@ private:
     // it the window simply vanishes and the app looks like it crashed.
     void announceStillRunning();
 
-    enum class CloseChoice { Cancel, Hide, Quit };
+    // The two events a user who is not looking at the window would otherwise miss: a device's mount
+    // coming up, and a mount that was up going away. Wired to DeviceList, which is where a machine
+    // id has a name to go with it - the node's own signals carry only the id.
+    void announceMounted(const QString &name, const QString &mountPoint);
+    void announceUnmounted(const QString &name);
+
+    // And the third: a mount that could not be brought up at all. Worth a notification of its own
+    // because nothing will try it again - the device sits in the list offering a Retry, and a user
+    // who is not looking at the window would never know to go and press it.
+    void announceMountFailed(const QString &name, const QString &reason);
+
+    // Wired to LocalNode::manualConnectFailed. The dialog that took the address is closed by the
+    // time an answer - or the lack of one - comes back, so this is where the news lands.
+    void reportManualConnectFailed(const QString &address, const QString &reason);
 
     // Asked only where there is no tray, because there the window is the whole application and
-    // closing it could mean either thing. Deliberately has no "do not ask again": this dialog is
-    // the one place a tray-less desktop can quit from, and remembering Hide would seal it off.
-    CloseChoice askWhatCloseMeans();
+    // closing it could mean either thing. The choice is CloseChoiceDialog's own enum rather than
+    // one of ours: it is the dialog that offers the three answers, and a second copy of them here
+    // would be a second thing to keep in step.
+    CloseChoiceDialog::Choice askWhatCloseMeans();
 
     Ui::MainWindow  *ui = nullptr;
     QAction         *deviceListAction;

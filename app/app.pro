@@ -28,22 +28,31 @@ CONFIG += c++20
 #DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
 SOURCES += \
+    appdialog.cpp \
     autostart.cpp \
+    closechoicedialog.cpp \
     devicelist.cpp \
     main.cpp \
     mainwindow.cpp \
+    manualconnectdialog.cpp \
     settingspage.cpp \
     singleinstance.cpp \
     titlebar.cpp \
 
 HEADERS += \
+    appdialog.h \
     autostart.h \
+    closechoicedialog.h \
     devicelist.h \
+    dockicon.h \
     elidedlabel.h \
     mainwindow.h \
+    manualconnectdialog.h \
+    revertbutton.h \
     settingspage.h \
     singleinstance.h \
     titlebar.h \
+    windowshadow.h \
 
 INCLUDEPATH += ../core
 
@@ -83,12 +92,54 @@ win32 {
 }
 
 macx {
-    # ICON
+    # What the Dock, Cmd-Tab, Finder and the notifications show. qmake copies it into
+    # Contents/Resources and names it in the bundle's Info.plist; without it the bundle carries no
+    # icon at all and macOS draws the blank generic application sheet.
+    #
+    # The same artwork the Windows build takes from the .ico beside it, converted because a bundle
+    # icon has to be .icns and nothing on macOS reads a .ico as one:
+    #
+    #   sips -s format png filedonkey_app_icon.ico --out src.png
+    #   for each size: sips -z $size $size src.png --out icon.iconset/icon_<name>.png
+    #   iconutil -c icns icon.iconset -o filedonkey_app_icon.icns
+    #
+    # The .ico holds 32 and 64 pixels and nothing larger, so everything above 64 in there is that
+    # 64 enlarged - which is what the Dock shows most of the time. Regenerate both files from a
+    # bigger original when there is one.
+    ICON = ../assets/filedonkey_app_icon.icns
+
     QMAKE_MACOSX_DEPLOYMENT_TARGET = 10.15
+
+    # The Dock icon comes and goes with the window - see dockicon.h for why. Objective-C++ and
+    # AppKit because the activation policy that decides it belongs to NSApplication and nothing in
+    # Qt reaches it. Nothing to build on the other platforms: the header's no-op stands in there.
+    OBJECTIVE_SOURCES += dockicon.mm
+    LIBS += -framework AppKit
 }
 
 linux {
-    # ICON
+    # No qmake variable to hand an icon to here: RC_ICONS and ICON above are Windows and macOS
+    # only, and a Linux binary has nowhere to carry one. The window gets its icon at runtime
+    # instead - see main() - and these two files are what the rest of the desktop reads: the
+    # launcher, and Wayland, where the shell takes the icon from the entry rather than the window.
+    #
+    # The entry's Exec has to name the installed binary, so it follows target.path below. Move one
+    # and the other has to move with it.
+    desktopEntry.files = ../assets/filedonkey.desktop
+    desktopEntry.path  = /usr/share/applications
+
+    # Icon= in that entry names this file, without the extension and without a path: the shell
+    # looks it up in the icon theme, so what matters is the base name and which size directory it
+    # lands in. Both sizes the .ico holds are installed - see the macOS note above for why there is
+    # nothing above 64 to install; a 128 here would be that 64 enlarged, and the shell would
+    # rightly prefer it.
+    icon32.files = ../assets/icons/32x32/filedonkey.png
+    icon32.path  = /usr/share/icons/hicolor/32x32/apps
+
+    icon64.files = ../assets/icons/64x64/filedonkey.png
+    icon64.path  = /usr/share/icons/hicolor/64x64/apps
+
+    INSTALLS += desktopEntry icon32 icon64
 }
 
 # Default rules for deployment.

@@ -1,6 +1,7 @@
 ﻿#include "devicelist.h"
 
 #include "elidedlabel.h"
+#include "manualconnectdialog.h"
 
 #include <QDesktopServices>
 #include <QFontMetrics>
@@ -12,6 +13,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QScrollArea>
+#include <QPushButton>
 #include <QStyle>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -40,6 +42,22 @@
 // the type's own size it would stand taller than the digits beside it rather than level with them.
 #define ARROW_GLYPH 9
 #define ARROW_GAP   4
+
+// The strip under the list: the hairline that divides it from the rows, the line saying why anyone
+// would connect a device by hand, and the button that opens the dialog for it.
+//
+// Both numbers are the settings page's, where they are SETTINGS_MARGIN and SETTINGS_SECTION_GAP -
+// the inset that page's content keeps from the window's edges, and the room it leaves around the
+// rule between its two halves. Repeated here rather than shared because the two pages are laid out
+// by different files and neither owns the other's spacing, so a change to either there has to be
+// answered here: the two rules are meant to be read as the same line seen on two pages, and they
+// only are while they sit the same distance in from the same edges.
+#define FOOTER_MARGIN 18
+#define FOOTER_SECTION_GAP 12
+
+// Between the line and the button. Wide enough that the two read as separate things - the line is
+// a remark, not the button's label.
+#define FOOTER_GAP 12
 
 namespace {
 
@@ -132,10 +150,21 @@ public:
     explicit DeviceRow(const Connection &conn, QWidget *parent = nullptr);
 
     void setMounted(const QString &mountPoint);
+    void setFailed(const QString &reason);
+
+    // Back to the state the row is built in. Pressing Retry is what asks for it: the mount starts
+    // again at once and the row should say so rather than sitting on the failure it is leaving.
+    void setMounting();
+
     void setUploaded(u64 uploaded);
     void setDownloaded(u64 downloaded);
 
     bool isMounted() const { return mounted; }
+    bool hasFailed() const { return failed; }
+
+    // The list wires this itself - see onPeerAdded, which is where a row is paired with the
+    // machine id a retry has to name. Nothing else about the button is anyone's business.
+    QPushButton *retryButton() const { return retryBtn; }
 
     const QString &name() const { return conn.machineName; }
 
@@ -163,8 +192,19 @@ private:
     QWidget     *uploadedBox   = nullptr;
     QWidget     *downloadedBox = nullptr;
 
+    // Shown only in the failed state, and the one control a row has ever carried.
+    QPushButton *retryBtn = nullptr;
+
     QString mountPoint;
     bool    mounted    = false;
+
+    // The mount was tried and did not come up. Never true at the same time as mounted: nothing
+    // reports a failure once the mount is up, and setMounted is the only thing that says it is.
+    bool    failed     = false;
+
+    // What to put on the second line while that is so, exactly as LocalNode phrased it.
+    QString failureReason;
+
     u64     uploaded   = 0;
     u64     downloaded = 0;
 };
@@ -227,6 +267,20 @@ DeviceRow::DeviceRow(const Connection &conn, QWidget *parent)
     uploadedBox->hide();
     downloadedBox->hide();
 
+    // Only ever seen on a row whose mount failed. A column of the row in its own right - see the
+    // layout at the end - rather than something sharing a line with the text: it belongs to the
+    // whole row, not to either of the two lines, and both of those need every pixel of width they
+    // can get for a machine name and a sentence saying what went wrong.
+    retryBtn = new QPushButton(DeviceList::tr("Retry"), this);
+    retryBtn->setObjectName("deviceRetryBtn");
+    retryBtn->setCursor(Qt::PointingHandCursor);
+
+    // As the footer's own button is: nothing in this window takes focus by tabbing, and a focus
+    // ring on one row's button would be the only one in the window.
+    retryBtn->setFocusPolicy(Qt::NoFocus);
+
+    retryBtn->hide();
+
     QHBoxLayout *titleLine = new QHBoxLayout;
     titleLine->setContentsMargins(0, 0, 0, 0);
     titleLine->setSpacing(7);
@@ -287,6 +341,11 @@ DeviceRow::DeviceRow(const Connection &conn, QWidget *parent)
     layout->addWidget(badgeLbl, 0, Qt::AlignVCenter);
     layout->addLayout(textColumn, 1);
 
+    // The third column, opposite the badge and centred against the pair of lines between them the
+    // same way it is. Taking no width at all while it is hidden, so every other row is laid out
+    // exactly as it was before there was a button to make room for.
+    layout->addWidget(retryBtn, 0, Qt::AlignVCenter);
+
     // Where every row starts: LocalNode emits peerAdded with the mount already under way, so there
     // is no moment at which a peer is known but nothing is being done about it.
     restyle(dotLbl, "state", "mounting");
@@ -320,6 +379,51 @@ void DeviceRow::setMounted(const QString &mountPoint)
     detailLbl->hide();
     uploadedBox->show();
     downloadedBox->show();
+
+    refreshDetail();
+    refreshToolTip();
+}
+
+// The mount could not be brought up, and nothing is going to try again until the button below is
+// pressed. The second line spends itself on why, which is the only thing worth saying here - and
+// the counters go, having nothing to count.
+void DeviceRow::setFailed(const QString &reason)
+{
+    failed        = true;
+    mounted       = false;
+    failureReason = reason;
+
+    restyle(dotLbl,    "state", "failed");
+    restyle(detailLbl, "state", "failed");
+
+    // There is nothing behind the row now, so the hand a mounted row shows would be a promise it
+    // cannot keep. The button is the only thing on it left to press.
+    setCursor(Qt::ArrowCursor);
+
+    if (mountLbl) mountLbl->hide();
+
+    uploadedBox->hide();
+    downloadedBox->hide();
+
+    detailLbl->show();
+    retryBtn->show();
+
+    refreshDetail();
+    refreshToolTip();
+}
+
+void DeviceRow::setMounting()
+{
+    failed = false;
+    failureReason.clear();
+
+    restyle(dotLbl, "state", "mounting");
+
+    // Cleared rather than set to anything: an invalid QVariant takes the property off, which is
+    // what puts the label back under the plain rule it is styled by the rest of the time.
+    restyle(detailLbl, "state", QVariant());
+
+    retryBtn->hide();
 
     refreshDetail();
     refreshToolTip();
@@ -387,6 +491,12 @@ void DeviceRow::setDownloaded(u64 downloaded)
 // the two states apart on the platforms with no mount point to show.
 void DeviceRow::refreshDetail()
 {
+    if (failed)
+    {
+        detailLbl->setText(failureReason);
+        return;
+    }
+
     if (!mounted)
     {
         detailLbl->setText(DeviceList::tr("mounting · %1").arg(conn.machineAddress));
@@ -409,6 +519,10 @@ void DeviceRow::refreshToolTip()
     if (!conn.machineOs.isEmpty()) text += QString(" · %1").arg(osName(conn.machineOs));
 
     text += QString("\n\n%1 : %2").arg(conn.machineAddress).arg(conn.machinePort);
+
+    // The second line elides, and a reason is the one thing a row shows that is a sentence rather
+    // than a label - so this is where it can be read in full.
+    if (failed) text += QString("\n\n%1").arg(failureReason);
 
     setToolTip(text);
 }
@@ -483,12 +597,82 @@ DeviceList::DeviceList(QWidget *parent)
     scroll->setFrameShape(QFrame::NoFrame);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 
+    // Under the list, and outside the scroll area on purpose: it is not one of the devices and must
+    // not scroll away with them - a user who cannot find a device is exactly the user who has
+    // scrolled to the bottom looking for it.
+    //
+    // The line beside the button says why rather than what: the button already says what pressing it
+    // does, and the only thing it cannot say is that a silent list may be the network's doing rather
+    // than a device that is switched off. Elided rather than wrapped, so a longer translation takes
+    // the room it has and the footer stays one line tall - the window cannot grow to fit it.
+    ElidedLabel *footerHint = new ElidedLabel(tr("Some networks block automatic discovery."), this);
+    footerHint->setObjectName("deviceFooterHint");
+    footerHint->setToolTip(footerHint->text());
+
+    QPushButton *manualBtn = new QPushButton(tr("Connect by IP…"), this);
+    manualBtn->setObjectName("manualConnectBtn");
+    manualBtn->setCursor(Qt::PointingHandCursor);
+
+    // As the settings page's Choose button is: nothing in this window takes focus by tabbing, and a
+    // focus ring on the one button down here would be the only one in the window.
+    manualBtn->setFocusPolicy(Qt::NoFocus);
+
+    connect(manualBtn, &QPushButton::clicked, this, &DeviceList::openManualConnect);
+
+    // The hint and the button on one line, so the rule above them can be a row of its own and still
+    // span the width the two of them do.
+    QWidget *footerLine = new QWidget(this);
+
+    QHBoxLayout *footerLineLayout = new QHBoxLayout(footerLine);
+    footerLineLayout->setContentsMargins(0, 0, 0, 0);
+    footerLineLayout->setSpacing(FOOTER_GAP);
+
+    // The hint takes what the button leaves, which is what puts the button in the corner and lets
+    // the line elide instead of pushing it out of the window.
+    footerLineLayout->addWidget(footerHint, 1, Qt::AlignVCenter);
+    footerLineLayout->addWidget(manualBtn, 0, Qt::AlignVCenter);
+
+    // A widget in the layout rather than a border on the footer, which is what insets it: a border
+    // runs the full width of whatever carries it, edge to edge of the window, and that reads as a
+    // second window frame rather than as a rule between two parts of one page. Built the way the
+    // settings page builds its own - see separatorLine() there - down to sharing the stylesheet
+    // rule that colours them.
+    QWidget *footerSeparator = new QWidget(this);
+    footerSeparator->setObjectName("deviceFooterSeparator");
+    footerSeparator->setAttribute(Qt::WA_StyledBackground, true);
+    footerSeparator->setFixedHeight(1);
+
+    QWidget *footer = new QWidget(this);
+    footer->setObjectName("deviceFooter");
+    footer->setAttribute(Qt::WA_StyledBackground, true);
+
+    // The rule, then the line of controls, with the same room around the rule that the settings
+    // page leaves around its own and the same inset from the window's edges.
+    QVBoxLayout *footerLayout = new QVBoxLayout(footer);
+    footerLayout->setContentsMargins(FOOTER_MARGIN, FOOTER_SECTION_GAP,
+                                     FOOTER_MARGIN, FOOTER_SECTION_GAP);
+    footerLayout->setSpacing(FOOTER_SECTION_GAP);
+    footerLayout->addWidget(footerSeparator);
+    footerLayout->addWidget(footerLine);
+
     QVBoxLayout *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
     layout->addWidget(scroll);
+    layout->addWidget(footer);
 
     refreshSummary();
+}
+
+void DeviceList::openManualConnect()
+{
+    ManualConnectDialog dialog(this);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    // Straight out again. Whether anything is at that address takes a moment to find out, and this
+    // list is not where the finding out happens - see LocalNode::connectManually(), and the window
+    // for what it does with a failure.
+    emit manualConnectRequested(dialog.address(), dialog.port());
 }
 
 void DeviceList::onPeerAdded(const Connection &conn)
@@ -499,6 +683,18 @@ void DeviceList::onPeerAdded(const Connection &conn)
 
     DeviceRow *row = new DeviceRow(conn);
     rows.insert(conn.machineId, row);
+
+    // The row knows nothing of machine ids past the one it was built from, and the node knows
+    // nothing else, so the pairing is made here where both are in hand. The row goes back to
+    // mounting on the spot rather than waiting to be told: the mount really has started again,
+    // and leaving the failure up until something else says otherwise reads as a button that did
+    // nothing.
+    connect(row->retryButton(), &QPushButton::clicked, this, [this, row, id = conn.machineId]() {
+        row->setMounting();
+        refreshSummary();
+
+        emit retryRequested(id);
+    });
 
     // Before the stretch that holds the rows at the top, and after the empty state, which is
     // hidden from here on.
@@ -515,6 +711,24 @@ void DeviceList::onPeerMounted(const QString &machineId, const QString &mountPoi
     row->setMounted(mountPoint);
 
     refreshSummary();
+
+    // Off the row rather than off the argument: setMounted() is where a bare drive letter is made
+    // into a path, and the notification should say the same thing the row does.
+    emit deviceMounted(row->name(), row->mount());
+}
+
+void DeviceList::onPeerMountFailed(const QString &machineId, const QString &reason)
+{
+    DeviceRow *row = rows.value(machineId, nullptr);
+    if (!row) return;
+
+    row->setFailed(reason);
+
+    refreshSummary();
+
+    // Off the row rather than off the id, as the pair above are: a notification has to name the
+    // machine the way the window does.
+    emit deviceMountFailed(row->name(), reason);
 }
 
 void DeviceList::onPeerUploaded(const QString &machineId, u64 uploaded)
@@ -538,11 +752,20 @@ void DeviceList::onPeerRemoved(const QString &machineId)
     DeviceRow *row = rows.take(machineId);
     if (!row) return;
 
+    // Copied out while the row still exists - the name is a reference into the row's own connection
+    // and the row is about to go. Whether it was mounted is read here for the same reason.
+    const QString name      = row->name();
+    const bool    wasMounted = row->isMounted();
+
     // Not deleteLater(): this arrives on the GUI thread from LocalNode, with nothing of the row's
     // own on the stack.
     delete row;
 
     refreshSummary();
+
+    // Only for a mount that was actually up. A peer whose mount never came up goes the same way as
+    // one that was unmounted, and announcing a drive that was never there would be a lie.
+    if (wasMounted) emit deviceUnmounted(name);
 }
 
 QList<DeviceList::Device> DeviceList::devices() const
@@ -558,7 +781,7 @@ QList<DeviceList::Device> DeviceList::devices() const
         if (!widget || widget == emptyState) continue;
 
         const DeviceRow *row = static_cast<const DeviceRow *>(widget);
-        found.append(Device{ row->name(), row->mount() });
+        found.append(Device{ row->name(), row->mount(), row->hasFailed() });
     }
 
     return found;
@@ -574,18 +797,25 @@ void DeviceList::refreshSummary()
     else if (rows.size() == 1) summaryLbl->setText(tr("1 device"));
     else                       summaryLbl->setText(tr("%1 devices").arg(rows.size()));
 
-    // Green as soon as one mount is up, amber while they are all still coming up, and the default
-    // grey of the stylesheet's dot rule when there is nothing to report.
-    QString state;
+    // Green as soon as one mount is up, amber while any of them is still coming up, red when all
+    // that is left is failures, and the default grey of the stylesheet's dot rule when there is
+    // nothing to report. In that order because it is the best news that is worth reporting: one
+    // device failing while another is mounted is the row's business, not the whole list's.
+    bool anyMounted  = false;
+    bool anyMounting = false;
+    bool anyFailed   = false;
+
     for (const DeviceRow *row : std::as_const(rows))
     {
-        state = "mounting";
-        if (row->isMounted())
-        {
-            state = "mounted";
-            break;
-        }
+        if (row->isMounted())      anyMounted  = true;
+        else if (row->hasFailed()) anyFailed   = true;
+        else                       anyMounting = true;
     }
+
+    QString state;
+    if (anyMounted)       state = "mounted";
+    else if (anyMounting) state = "mounting";
+    else if (anyFailed)   state = "failed";
 
     restyle(summaryDot, "state", state);
 }

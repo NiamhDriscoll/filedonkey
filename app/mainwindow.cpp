@@ -1,11 +1,13 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 
+#include "dockicon.h"
+#include "windowshadow.h"
+
 #include <QApplication>
 #include <QCloseEvent>
 #include <QDesktopServices>
 #include <QFile>
-#include <QGraphicsDropShadowEffect>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPainter>
@@ -22,12 +24,8 @@
 
 #define THEME_LIGHTNESS_BARRIER 128
 
-// The strip of window kept empty around the visible frame for the shadow to fall on. Everything
-// inside it - title bar, content, status bar - is inset by this much, and the window is grown to
-// match so the visible part stays the size the .ui file asked for.
-#define SHADOW_MARGIN   18
-#define SHADOW_BLUR     28
-#define SHADOW_OFFSET_Y 6
+// SHADOW_MARGIN, and the widget that throws the blur into it, come from windowshadow.h - this
+// window and the manual connect dialog are both frameless and both need the same one.
 
 // APP_VERSION and APP_STAGE come from app.pro, which is where they are written down: it is the
 // file Windows' VERSIONINFO block is filled from, and a number kept here as well would be a second
@@ -51,6 +49,12 @@
 #define TRAY_DOT_ICON 16
 #define TRAY_DOT_SIZE 8
 
+// How long a mount notification is asked to stay up. A hint only - Windows and the Linux
+// notification daemons each have a timeout of their own and are free to ignore this - and short
+// because there is nothing to read past the first line: two devices coming up together should not
+// leave the second waiting behind the first.
+#define TRAY_MESSAGE_MS 5000
+
 namespace {
 
 // Amber while the mount is coming up, green once it is up - the two colours in the #deviceDot
@@ -59,6 +63,7 @@ namespace {
 // and changing a colour means changing it in both places.
 #define TRAY_DOT_MOUNTING QColor(0xE0, 0xA3, 0x3C)
 #define TRAY_DOT_MOUNTED  QColor(0x4E, 0xC9, 0x7A)
+#define TRAY_DOT_FAILED   QColor(0xE0, 0x57, 0x4C)
 
 // Drawn at the display's scale factor rather than at 16 square and left to be blown up, so the
 // circle keeps its edge on a HiDPI screen. The painter works in the icon's own coordinates either
@@ -107,37 +112,21 @@ MainWindow::MainWindow(QWidget *parent)
 
     ui->setupUi(this);
 
-    // Off with the native title bar, on with ours. setMenuWidget() puts the bar in the slot the
-    // menu bar had, spanning the full width above the central widget, and deletes the empty
-    // QMenuBar the .ui file brings with it.
+    // Off with the native title bar. Ours goes at the top of the central widget's own layout -
+    // see where contentLayout is built, which is also where the reason it goes there is.
     setWindowFlags(windowFlags() | Qt::FramelessWindowHint);
 
     // Rounded corners need somewhere for the corner to go. Without this the window is an opaque
     // rectangle and a radius only rounds the colour inside it, leaving the square corner behind;
     // with it, the pixels the radius cuts away are genuinely absent and the desktop shows through.
     // What the window looks like is then entirely up to the three widgets stacked inside it - see
-    // the border and radius rules on #titleBar, #centralwidget and QStatusBar in the stylesheet.
+    // the border and radius rules on #titleBar, #contentStack and QStatusBar in the stylesheet.
     setAttribute(Qt::WA_TranslucentBackground);
 
-    // A graphics effect on a top-level window does not render, so the shadow cannot go on the
-    // window itself. It goes on a child instead: a plain widget the size and shape of the visible
-    // frame, stacked behind everything and painted the same colour as the corners it sits under.
-    // Its own body is covered by the title bar, the content and the status bar - all that is ever
-    // seen of it is the blur it throws into the margin outside.
-    shadowLayer = new QWidget(this);
-    shadowLayer->setObjectName("windowShadow");
-    shadowLayer->setAttribute(Qt::WA_StyledBackground, true);
-    shadowLayer->setAttribute(Qt::WA_TransparentForMouseEvents, true);
-
-    QGraphicsDropShadowEffect *shadow = new QGraphicsDropShadowEffect(shadowLayer);
-    shadow->setBlurRadius(SHADOW_BLUR);
-    shadow->setOffset(0, SHADOW_OFFSET_Y);
-    shadow->setColor(QColor(0, 0, 0, 160));
-    shadowLayer->setGraphicsEffect(shadow);
-
-    // setupUi() has already made the central widget, so this one is the youngest sibling and
-    // would otherwise sit on top of the lot.
-    shadowLayer->lower();
+    // The blur that falls into the margin below. Built after setupUi(), which has already made the
+    // central widget - windowShadow() lowers what it builds, so this one being the youngest sibling
+    // does not leave it sitting on top of the lot.
+    shadowLayer = windowShadow(this);
 
     setContentsMargins(SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN);
 
@@ -151,9 +140,8 @@ MainWindow::MainWindow(QWidget *parent)
     // and it can no longer change size.
     shadowLayer->setGeometry(contentsRect());
 
-    titleBar = new TitleBar(this);
+    titleBar = new TitleBar(TitleBar::Kind::Window, ui->centralwidget);
     titleBar->setTitle(windowTitle());
-    setMenuWidget(titleBar);
 
     // Asked once, before anything decides what closing the window should mean.
     trayAvailable = QSystemTrayIcon::isSystemTrayAvailable();
@@ -174,17 +162,13 @@ MainWindow::MainWindow(QWidget *parent)
         titleBar->setCurrentTab(TitleBar::Tab::DeviceList);
     });
 
-#if defined(Q_OS_MACOS)
-    // Clicking the Dock icon of an app with no window open should bring the window back, the way
-    // every mac app behaves. Qt surfaces that as the application going active - only act on it
-    // while the window is actually away, or every Cmd-Tab would yank it to the front.
-    connect(qApp, &QGuiApplication::applicationStateChanged, this, [this](Qt::ApplicationState state) {
-        if (state == Qt::ApplicationActive && isHidden())
-        {
-            restoreWindow();
-        }
-    });
-#endif
+    // A window-less application going active used to bring the window back here, to answer a click
+    // on the Dock icon the way a mac user expects. The icon now leaves with the window - see
+    // dockicon.h - so there is nothing left to click, and what that connection actually caught was
+    // the application being made active for any other reason: at launch, which is why --tray put up
+    // the very window it was told not to, and on the way to the tray menu, which would have
+    // reopened the window in front of the menu the user was reaching for. The tray menu is how the
+    // window comes back now, and a second start of the application - see SingleInstance below.
 
     quitAction = new QAction(QIcon(":/assets/quit.svg"), tr("&Quit"), this);
     connect(quitAction, &QAction::triggered, qApp, &QCoreApplication::quit);
@@ -242,9 +226,21 @@ MainWindow::MainWindow(QWidget *parent)
         titleBar->setTitle(windowTitle());
     });
 
+    // The window's frame, top to bottom, in the two pieces the central widget holds: the title bar,
+    // which owns the upper two corners, and the stack below it, which carries the straight run of
+    // border down each side until the status bar closes the window off with the lower two. The same
+    // three pieces a dialog is built from - see AppDialog, which stacks them the same way.
+    //
+    // The bar goes here rather than in the slot QMainWindow keeps for a menu bar, which is where
+    // setMenuWidget() used to put it. That slot is not ours to hold: QMainWindow::menuBar() finds
+    // whatever is in it is not a QMenuBar, builds one, and installs it - which deletes what was
+    // there. Nothing in this application asks a window for its menu bar, but a style may, and KDE's
+    // Breeze does, from polish() as the window is first shown: the bar was destroyed on the way up
+    // and the window arrived with no caption at all, on that desktop only.
     QVBoxLayout *contentLayout = new QVBoxLayout(ui->centralwidget);
     contentLayout->setContentsMargins(0, 0, 0, 0);
     contentLayout->setSpacing(0);
+    contentLayout->addWidget(titleBar);
     contentLayout->addWidget(contentStack);
 
     node = new LocalNode(this);
@@ -256,6 +252,31 @@ MainWindow::MainWindow(QWidget *parent)
     connect(node, &LocalNode::peerUploaded,   deviceList, &DeviceList::onPeerUploaded);
     connect(node, &LocalNode::peerDownloaded, deviceList, &DeviceList::onPeerDownloaded);
     connect(node, &LocalNode::peerRemoved,    deviceList, &DeviceList::onPeerRemoved);
+    connect(node, &LocalNode::peerMountFailed, deviceList, &DeviceList::onPeerMountFailed);
+
+    // The one thing the list asks of the node. Straight through: retryMount() decides for itself
+    // whether the machine named is in a state to be mounted again.
+    connect(deviceList, &DeviceList::retryRequested, node, &LocalNode::retryMount);
+
+    // The one thing that travels the other way. The list collects an address and knows nothing to
+    // do with it; the node dials it and, when nothing answers, says so back through here. A peer
+    // that does answer needs no wiring of its own - it arrives as peerAdded above, like any other.
+    connect(deviceList, &DeviceList::manualConnectRequested, node, &LocalNode::connectManually);
+
+    // The tray's running commentary on the mounts. Taken from the list rather than straight from the
+    // node's peerMounted/peerRemoved because those name a machine by id, and the rows are where the
+    // id has ever been paired with a name.
+    connect(deviceList, &DeviceList::deviceMounted,   this, &MainWindow::announceMounted);
+    connect(deviceList, &DeviceList::deviceUnmounted, this, &MainWindow::announceUnmounted);
+    connect(deviceList, &DeviceList::deviceMountFailed, this, &MainWindow::announceMountFailed);
+
+    // Queued, unlike every other connection here. What it reaches opens a modal message box, and a
+    // modal box runs an event loop of its own - delivered directly it would start that loop inside
+    // the socket callback the failure was noticed in, with the socket the node had just handed to
+    // deleteLater() being freed under the very call still returning through it. Queued, the stack
+    // is back at the event loop before the box goes up.
+    connect(node, &LocalNode::manualConnectFailed, this, &MainWindow::reportManualConnectFailed,
+            Qt::QueuedConnection);
 
     // The left-hand end of the status bar. Neither half goes through tr(): a version number is the
     // same string in every language, and lupdate cannot see a stage that arrives as a macro anyway.
@@ -337,10 +358,18 @@ void MainWindow::hideWindow()
 {
     hide();
     titleBar->setCurrentTab(TitleBar::Tab::DeviceList);
+
+    // After hide(), so the window is already off screen when the application leaves the Dock -
+    // see dockicon.h. Nothing on Windows or Linux.
+    setDockIconVisible(false);
 }
 
 void MainWindow::restoreWindow()
 {
+    // Before the window is shown: coming back into the Dock is what lets the application become
+    // the active one again, and a window shown ahead of it would come up behind everything else.
+    setDockIconVisible(true);
+
     // showNormal() on its own leaves a hidden window behind whatever has focus, and a minimised
     // one comes back minimised. Clearing the state first, then all three calls, is what actually
     // puts it in front on every platform.
@@ -367,50 +396,54 @@ void MainWindow::closeEvent(QCloseEvent *event)
 
     switch (askWhatCloseMeans())
     {
-        case CloseChoice::Cancel:
+        case CloseChoiceDialog::Choice::Cancel:
             break;
 
-        case CloseChoice::Hide:
+        case CloseChoiceDialog::Choice::Hide:
             hideWindow();
             break;
 
-        case CloseChoice::Quit:
+        case CloseChoiceDialog::Choice::Quit:
             qApp->quit();
             break;
     }
 }
 
-MainWindow::CloseChoice MainWindow::askWhatCloseMeans()
+// Why a typed address came to nothing. Shown from here rather than from the dialog that collected
+// it, which is long closed: the attempt takes seconds - a TCP connect to an address with nothing on
+// it answers with silence, not a refusal - and a modal dialog held open for them is one that looks
+// stuck. Nothing is shown when it works; the row appearing in the list is what says so.
+void MainWindow::reportManualConnectFailed(const QString &address, const QString &reason)
 {
+    // Brought back first. The window may well have been put away while the attempt was running, and
+    // a message box on its own with no window behind it says nothing about who is asking.
+    restoreWindow();
+    titleBar->setCurrentTab(TitleBar::Tab::DeviceList);
+
     QMessageBox box(this);
     box.setIcon(QMessageBox::Warning);
     box.setWindowTitle(tr("FileDonkey"));
-    box.setText(tr("Close the window, or quit FileDonkey?"));
-    box.setInformativeText(tr(
-        "There is no system tray on this desktop, so FileDonkey has nowhere to sit while it runs.\n\n"
-        "Quitting unmounts every connected device and drops all connections.\n\n"
-        "Hiding keeps them running. Start FileDonkey again to bring this window back."));
-
-    // AcceptRole and DestructiveRole rather than fixed positions: each platform orders its
-    // buttons its own way, and the roles are what let it.
-    QPushButton *hideButton = box.addButton(tr("Hide"), QMessageBox::AcceptRole);
-    QPushButton *quitButton = box.addButton(tr("Quit"), QMessageBox::DestructiveRole);
-    QPushButton *cancelButton = box.addButton(QMessageBox::Cancel);
-
-    // Named so the stylesheet can pick it out and give it the error red - it is the one button
-    // here that loses work.
-    quitButton->setObjectName("dialogQuitBtn");
-
-    box.setDefaultButton(hideButton);
-    box.setEscapeButton(cancelButton);
-
+    box.setText(tr("Could not connect to %1.").arg(address));
+    box.setInformativeText(reason);
+    box.setStandardButtons(QMessageBox::Ok);
     box.exec();
+}
 
-    if (box.clickedButton() == quitButton) return CloseChoice::Quit;
-    if (box.clickedButton() == hideButton) return CloseChoice::Hide;
+// The question itself, its wording and the order of its buttons are the dialog's - see
+// closechoicedialog.h. All that is left here is asking it.
+//
+// It is a window of this application's own rather than a QMessageBox, which is what it used to be:
+// a message box wears the system's frame and the system's button layout, and beside a window that
+// draws its own it looked like a dialog from a different program.
+CloseChoiceDialog::Choice MainWindow::askWhatCloseMeans()
+{
+    CloseChoiceDialog dialog(this);
+    dialog.exec();
 
-    // Covers Cancel, Escape, and the window being dismissed by the desktop.
-    return CloseChoice::Cancel;
+    // Read off the dialog rather than from exec()'s own result: two of the three answers accept it
+    // and only the dialog knows which of them was pressed. Cancel covers the rest - the Cancel
+    // button, Escape, and the close button in the title bar.
+    return dialog.choice();
 }
 
 void MainWindow::announceStillRunning()
@@ -425,6 +458,63 @@ void MainWindow::announceStillRunning()
                           6000);
 
     settings.setValue("tray/closeNoticeShown", true);
+}
+
+// A device has finished mounting.
+//
+// The mount point is only worth naming on Windows, where it is a drive letter the user can type
+// straight into a path. On macOS and Linux the mount lands in $HOME/.filedonkey/<machine> - see
+// VirtDisk::mount(), which keeps our mounts of other peers out of the home directory we ourselves
+// serve - and that is a hidden folder nobody navigates to by hand: a notification read in passing
+// would spend its one line on a path that leads nowhere useful. The row in the window is where
+// anyone who wants the path can still find it, and clicking it opens the folder anyway.
+void MainWindow::announceMounted(const QString &name, const QString &mountPoint)
+{
+    // Both checks. isSystemTrayAvailable() was answered once at startup and says whether there is a
+    // tray at all; supportsMessages() says whether this one can show a balloon - a tray that cannot
+    // takes showMessage() silently, and the notification would simply never appear.
+    if (!trayAvailable || !QSystemTrayIcon::supportsMessages()) return;
+
+#if defined(Q_OS_WIN)
+    // Empty should not happen on Windows - the drive letter is picked before the mount starts - but
+    // the notification is not the place to find that out.
+    const QString body = mountPoint.isEmpty() ? tr("Its files are ready to browse.")
+                                              : tr("Its files are at %1").arg(mountPoint);
+#else
+    Q_UNUSED(mountPoint);
+
+    const QString body = tr("Its files are ready to browse. Open it from the device list.");
+#endif
+
+    trayIcon->showMessage(tr("%1 mounted").arg(name),
+                          body,
+                          QSystemTrayIcon::Information,
+                          TRAY_MESSAGE_MS);
+}
+
+// The other end of the same pair. Only mounts that were actually up reach here - see
+// DeviceList::onPeerRemoved(), which keeps a peer that never mounted quiet.
+void MainWindow::announceUnmounted(const QString &name)
+{
+    if (!trayAvailable || !QSystemTrayIcon::supportsMessages()) return;
+
+    trayIcon->showMessage(tr("%1 unmounted").arg(name),
+                          tr("The device is no longer connected."),
+                          QSystemTrayIcon::Information,
+                          TRAY_MESSAGE_MS);
+}
+
+// The third of them, and the only one the user has anything to do about. It says the reason
+// rather than pointing at the window for it: a notification that only says something went wrong
+// is a notification that has to be followed up, and the reasons here are one line each.
+void MainWindow::announceMountFailed(const QString &name, const QString &reason)
+{
+    if (!trayAvailable || !QSystemTrayIcon::supportsMessages()) return;
+
+    trayIcon->showMessage(tr("%1 could not be mounted").arg(name),
+                          reason,
+                          QSystemTrayIcon::Warning,
+                          TRAY_MESSAGE_MS);
 }
 
 void MainWindow::createTrayIcon()
@@ -486,13 +576,18 @@ void MainWindow::refreshTrayDevices()
     {
         const bool mounted = !device.mountPoint.isEmpty();
 
+        // The three the rows show, in the same colours. A device whose mount failed is not on its
+        // way anywhere, and an amber dot beside it would say it was.
+        const QColor dot = mounted        ? TRAY_DOT_MOUNTED
+                         : device.failed  ? TRAY_DOT_FAILED
+                                          : TRAY_DOT_MOUNTING;
+
         // An ampersand in a machine name would be eaten as a mnemonic and underline the letter
         // after it. Doubling it is how a QAction is told the name means it literally.
         QString name = device.name;
         name.replace('&', "&&");
 
-        QAction *action = new QAction(trayDot(mounted ? TRAY_DOT_MOUNTED : TRAY_DOT_MOUNTING),
-                                      name, this);
+        QAction *action = new QAction(trayDot(dot), name, this);
 
         // What clicking a row does, where there is something to click through to: a mounted device
         // opens in the desktop's file manager. One still coming up has nowhere to go yet, so it

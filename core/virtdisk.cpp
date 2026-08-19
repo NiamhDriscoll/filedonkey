@@ -34,8 +34,12 @@
 #include <QElapsedTimer>
 #include <QHostAddress>
 #include <QDir>
+#include <QFile>
 #include <QProcess>
+#include <QSaveFile>
 #include <QTcpSocket>
+#include <QTextStream>
+#include <QUrl>
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/mount.h>
@@ -52,7 +56,7 @@ extern char **environ;
 
 #if defined (_WIN32)
 #include <fileapi.h>
-#include <winfsp_fuse.h>
+#include <fuse_win32.h>
 
 #define mkdir(path, mode) _mkdir(path)
 
@@ -66,6 +70,11 @@ extern char **environ;
 #define st_mtimespec st_mtim
 #define st_ctimespec st_ctim
 #endif
+
+// The most the goodbye at the end of Start() is waited on. It is one header, so it either goes
+// into the first segment or the peer is not reading anyway - and every moment spent here is a
+// moment the mount thread has not finished, with the GUI thread waiting to join it.
+#define BYE_WRITE_TIMEOUT_MS 1000
 
 VirtDisk::VirtDisk(const Connection& conn) : conn(conn)
 {
@@ -183,18 +192,25 @@ static int fd_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
         st.st_ino = fd->st_ino;
         st.st_mode = fd->st_mode;
-#if defined (_WIN32)
-        st.st_size = 146;
-        st.st_blksize = 4096;
-        st.st_blocks = 2;
-        st.st_atim.tv_sec = 1763752599;
-        st.st_atim.tv_nsec = 302761200;
-        st.st_mtim.tv_sec = 1747514473;
-        st.st_mtim.tv_nsec = 21076073;
-        st.st_ctim.tv_sec = 1747514473;
-        st.st_ctim.tv_nsec = 21076073;
-#endif
 
+        // One, not zero, on every platform. FUSE_FILL_DIR_PLUS below says these attributes are the
+        // file's real ones and they are cached as such, and a link count of zero is how a stat
+        // describes something that has already been unlinked.
+        st.st_nlink = 1;
+
+        st.st_size = fd->st_size;
+
+        st.st_atimespec.tv_sec  = fd->st_atim.tv_sec;
+        st.st_atimespec.tv_nsec = fd->st_atim.tv_nsec;
+        st.st_mtimespec.tv_sec  = fd->st_mtim.tv_sec;
+        st.st_mtimespec.tv_nsec = fd->st_mtim.tv_nsec;
+        st.st_ctimespec.tv_sec  = fd->st_ctim.tv_sec;
+        st.st_ctimespec.tv_nsec = fd->st_ctim.tv_nsec;
+
+        // Now true on all three platforms, where it used to be a promise only Windows tried to
+        // keep and kept with invented numbers. Linux and macOS pass the size and times straight
+        // through to a readdirplus reply; Windows has to have them, because FindFiles is the only
+        // chance it gets to describe an entry.
         filler(buf, fd->name, &st, 0, fuse_fill_dir_flags::FUSE_FILL_DIR_PLUS);
     }
     qDebug() << "after for";
@@ -449,7 +465,78 @@ static void UnmountAt(const std::string &mountpoint)
 }
 #endif
 
-static void StartImpl(VirtDisk *self, Connection *conn)
+#if defined(__linux__)
+// The GTK bookmarks file, which is what fills the sidebar in Nautilus and in every GTK file chooser.
+// One line per entry: a URI, then a space, then the label to show it under.
+//
+// Only ever edited when it is already there. It belongs to the desktop, not to us, and a session
+// whose file manager has never written one is not asking us to start it off.
+static std::mutex gtkBookmarksMutex;
+
+// Percent-encoded past what a URI strictly needs, apostrophes and all, because the label is
+// separated from the URI by a space: a machine name carrying one - "Alcamaney's PC" - would
+// otherwise split there and the sidebar would show the tail of the path as the name.
+static QString GtkBookmarkUri(const std::string &mountpoint)
+{
+    return "file://" + QString::fromUtf8(
+        QUrl::toPercentEncoding(QString::fromStdString(mountpoint), "/"));
+}
+
+// Adds our line or takes it away; either way the file is rewritten without whatever line was
+// already pointing at this mount point. That is not only for the removal: mounting the same peer a
+// second time after a crash left the first entry behind would otherwise stack up duplicates.
+//
+// Guarded because two threads reach this. The add runs on the peer's own fuse thread, the removal
+// on the GUI thread, and every peer has a fuse thread of its own - at startup they all mount at
+// about the same moment, so several read-modify-writes of one file genuinely do overlap.
+static void SetGtkBookmark(const std::string &mountpoint, const QString &label, bool present)
+{
+    if (mountpoint.empty()) return;
+
+    std::lock_guard<std::mutex> lock(gtkBookmarksMutex);
+
+    const QString bookmarksPath = QDir::homePath() + "/.config/gtk-3.0/bookmarks";
+
+    QFile file(bookmarksPath);
+    if (!file.exists()) return;
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) return;
+
+    const QString uri = GtkBookmarkUri(mountpoint);
+
+    QStringList lines;
+    QTextStream in(&file);
+    while (!in.atEnd())
+    {
+        const QString line = in.readLine();
+
+        // Ours is any line whose URI is this mount point, whatever label was written after it.
+        if (line == uri || line.startsWith(uri + " ")) continue;
+
+        lines.append(line);
+    }
+    file.close();
+
+    if (present) lines.append(label.isEmpty() ? uri : uri + " " + label);
+
+    // Through a QSaveFile: this is the user's own bookmark list, and rewriting it in place would
+    // lose the rest of it if we died between the truncate and the write.
+    QSaveFile out(bookmarksPath);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Text)) return;
+
+    QTextStream stream(&out);
+    for (const QString &line : std::as_const(lines)) stream << line << "\n";
+    stream.flush();
+
+    out.commit();
+}
+#endif
+
+// Brings one peer's mount up and stays inside fuse_loop until it comes down again. Returns empty
+// once that has run its course, and a sentence naming what went wrong for every way it can end
+// before the mount exists - the peer unreachable, no drive letter free, the file system refusing
+// to mount. Those sentences are shown to the user and are the only account they get, so they name
+// the thing that failed rather than the call that reported it.
+static QString StartImpl(VirtDisk *self, Connection *conn)
 {
     self->socket = new QTcpSocket();
 
@@ -466,7 +553,14 @@ static void StartImpl(VirtDisk *self, Connection *conn)
     if (!self->socket->waitForConnected())
     {
         qDebug() << "[Start] socket connection error:" << self->socket->errorString();
-        return;
+
+        // The peer announced itself moments ago, so it is up; what this usually means is a
+        // firewall on the transfer port, or a peer whose port setting has moved and whose
+        // announcements have not caught up.
+        return VirtDisk::tr("Could not reach %1 on port %2. %3")
+                   .arg(conn->machineAddress)
+                   .arg(conn->machinePort)
+                   .arg(self->socket->errorString());
     }
     qDebug() << "[Start] socket connected";
 
@@ -513,7 +607,7 @@ static void StartImpl(VirtDisk *self, Connection *conn)
     {
         qDebug() << "[Start] fuse_new failed";
         fuse_opt_free_args(&args);
-        return;
+        return VirtDisk::tr("Could not create the file system for this device.");
     }
 
     struct fuse_session *se = fuse_get_session(self->f);
@@ -530,7 +624,7 @@ static void StartImpl(VirtDisk *self, Connection *conn)
         fuse_destroy(self->f);
         self->f = nullptr;
         fuse_opt_free_args(&args);
-        return;
+        return VirtDisk::tr("There is no free drive letter left to mount this device on.");
     }
     self->mountpoint = QString("%1:").arg(driveLetter).toStdString();
     qDebug() << "[Start] mounting" << conn->machineName << "on" << self->mountpoint.c_str()
@@ -557,15 +651,41 @@ static void StartImpl(VirtDisk *self, Connection *conn)
         mkdir(self->mountpoint.c_str(), 0755);
     }
     qDebug() << "[Start] mntdir_rc rc:" << mntdir_rc << "errno:" << errno;
-#endif // _WIN32
 
-    if (fuse_mount(self->f, self->mountpoint.c_str()) != 0)
+    // The recovery above can get nowhere: it only ever unmounts and remakes the leaf, and if the
+    // directory holding it does not exist - a base that is not there, or one this user cannot
+    // write to - neither mkdir did anything. Say so here rather than leaving it to fuse_mount,
+    // which reports the same failure without naming the path that caused it.
+    struct stat mntdir_st;
+    if (::stat(self->mountpoint.c_str(), &mntdir_st) != 0 || !S_ISDIR(mntdir_st.st_mode))
     {
-        qDebug() << "[Start] fuse_mount failed";
+        qDebug() << "[Start] mountpoint directory is not there";
         fuse_destroy(self->f);
         self->f = nullptr;
         fuse_opt_free_args(&args);
-        return;
+        return VirtDisk::tr("Could not create the mount directory %1.")
+                   .arg(QString::fromStdString(self->mountpoint));
+    }
+#endif // _WIN32
+
+    const int mount_rc = fuse_mount(self->f, self->mountpoint.c_str());
+    if (mount_rc != 0)
+    {
+        qDebug() << "[Start] fuse_mount failed:" << mount_rc;
+        fuse_destroy(self->f);
+        self->f = nullptr;
+        fuse_opt_free_args(&args);
+
+#if defined (_WIN32)
+        // Dokan's own verdict, which is specific enough to act on - a missing driver and a drive
+        // letter something else has taken want different things done about them.
+        return VirtDisk::tr("Could not mount %1. %2")
+                   .arg(QString::fromStdString(self->mountpoint))
+                   .arg(QString::fromUtf8(fuse_mount_error(mount_rc)));
+#else
+        return VirtDisk::tr("Could not mount %1.")
+                   .arg(QString::fromStdString(self->mountpoint));
+#endif
     }
 
     if (fuse_set_signal_handlers(se) != 0)
@@ -575,12 +695,19 @@ static void StartImpl(VirtDisk *self, Connection *conn)
         fuse_destroy(self->f);
         self->f = nullptr;
         fuse_opt_free_args(&args);
-        return;
+        return VirtDisk::tr("Could not set up the file system's signal handlers.");
     }
 
     // Everything that could still have failed has been done, and the file system is about to start
     // answering. Queued to whoever owns this VirtDisk, like stopped() below.
     emit self->mounted(QString::fromStdString(self->mountpoint));
+
+#if defined(__linux__)
+    // Put the peer in the file manager's sidebar under its machine name. Without it the mount is
+    // effectively unreachable from the desktop: it lands in ~/.filedonkey, a hidden directory
+    // nobody navigates to by hand - see the mount point chosen above for why it has to be hidden.
+    SetGtkBookmark(self->mountpoint, conn->machineName, true);
+#endif
 
     int rc = fuse_loop(self->f);
     qDebug() << "[Start] fuse_loop returned" << rc;
@@ -591,11 +718,15 @@ static void StartImpl(VirtDisk *self, Connection *conn)
     fuse_opt_free_args(&args);
 
     self->f = nullptr;
+
+    // The mount ran and has come down. Whatever ended it - the peer's socket dropping, the user
+    // closing the window - is an ordinary teardown, not something to put in front of anyone.
+    return QString();
 }
 
 static void Start(VirtDisk *self, Connection *conn)
 {
-    StartImpl(self, conn);
+    const QString reason = StartImpl(self, conn);
 
     // Closing our end is what makes the teardown symmetric: the peer's server notices the drop on
     // its event loop and stops the VirtDisk facing us. Leaving it open would keep the connection
@@ -604,6 +735,24 @@ static void Start(VirtDisk *self, Connection *conn)
     // so this is the right place to destroy it.
     if (self->socket)
     {
+        // A mount that never came up is not this machine going away, and nothing about a socket
+        // closing says which of the two it was - see OperationType::bye for what the peer does
+        // with the difference. Sent before the close, never after: TCP delivers it ahead of the
+        // FIN, which is what has the peer read the two in the order they were meant.
+        if (!reason.isEmpty() && self->socket->state() == QAbstractSocket::ConnectedState)
+        {
+            const DatagramHeader bye(MessageType::Request, OperationType::bye);
+
+            self->socket->write(QByteArray((const char *)&bye, sizeof(DatagramHeader)));
+            self->socket->flush();
+
+            // This thread has no event loop, so nothing else would ever push those bytes out - and
+            // the socket is destroyed a few lines below, which would take them with it. Worth no
+            // more than a moment either way: the peer keeping its mount is a courtesy, and a
+            // machine that has stopped listening simply gets the old behaviour.
+            self->socket->waitForBytesWritten(BYE_WRITE_TIMEOUT_MS);
+        }
+
         self->client->setSocket(nullptr);
         self->socket->close();
         delete self->socket;
@@ -613,8 +762,9 @@ static void Start(VirtDisk *self, Connection *conn)
     // Queued to whoever owns this VirtDisk, so they can join and delete it now that the mount is
     // gone. This thread is about to return, so that join costs nothing. Emitting from the wrapper
     // rather than inside StartImpl covers its failure returns too - a VirtDisk that never got as
-    // far as mounting must still be cleaned up, or its peer can never be rediscovered.
-    emit self->stopped();
+    // far as mounting must still be cleaned up, or its peer can never be rediscovered - and the
+    // reason is what says which of the two happened.
+    emit self->stopped(reason);
 }
 
 void VirtDisk::onSocketDisconnected()
@@ -651,7 +801,12 @@ void VirtDisk::mount(const QString &mountPoint)
 
     connect(worker, &QProcess::finished, this, [this]() {
         qDebug() << "[VirtDisk::mount] mount helper exited for:" << conn.machineName;
-        emit stopped();
+
+        // Drained first. finished() and the last readyReadStandardOutput() are not ordered, and
+        // what may still be sitting in that pipe is the line saying why the mount never came up.
+        onWorkerOutput();
+
+        emit stopped(workerFailure);
     });
 
     // finished() never comes if the helper could not be launched at all, and without a stopped()
@@ -660,7 +815,7 @@ void VirtDisk::mount(const QString &mountPoint)
     connect(worker, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
         if (error != QProcess::FailedToStart) return;
         qDebug() << "[VirtDisk::mount] mount helper failed to start:" << worker->errorString();
-        emit stopped();
+        emit stopped(tr("The mount helper could not be started. %1").arg(worker->errorString()));
     });
 
     worker->start();
@@ -693,6 +848,16 @@ int VirtDisk::runMountWorker()
     // list in the window is waiting on it.
     connect(this, &VirtDisk::mounted, this, [](const QString &mountPoint) {
         printf("@mounted %s\n", mountPoint.toUtf8().constData());
+        fflush(stdout);
+    });
+
+    // The other verdict, on the same channel. Without it a mount that failed in here reaches the
+    // parent as nothing but an exit code, and the row in the window is left saying the device is
+    // still coming up - this process is the only one that knows what went wrong.
+    connect(this, &VirtDisk::stopped, this, [](const QString &reason) {
+        if (reason.isEmpty()) return;
+
+        printf("@failed %s\n", reason.toUtf8().constData());
         fflush(stdout);
     });
 
@@ -729,6 +894,14 @@ void VirtDisk::onWorkerOutput()
         if (line.startsWith("@mounted "))
         {
             emit mounted(QString::fromUtf8(line.mid(sizeof("@mounted ") - 1)));
+            continue;
+        }
+
+        // Held rather than emitted. The helper is still on its way out, and stopped() - which is
+        // what our owner acts on - belongs to the moment it has actually gone.
+        if (line.startsWith("@failed "))
+        {
+            workerFailure = QString::fromUtf8(line.mid(sizeof("@failed ") - 1));
             continue;
         }
     }
@@ -790,6 +963,13 @@ void VirtDisk::unmountLinux()
     if (mountpoint.empty() || unmountedLinux) return;
 
     unmountedLinux = true;
+
+    // The sidebar entry goes with the mount that put it there. This is the one place to do it: it
+    // runs once, and it runs on every way down - the socket dropping, the window closing, and
+    // LocalNode's destructor, which cuts our signals before stopping us and so is not reachable
+    // from anything wired to mounted()/stopped().
+    SetGtkBookmark(mountpoint, QString(), false);
+
     UnmountAt(mountpoint);
 }
 #endif
